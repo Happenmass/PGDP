@@ -7,9 +7,10 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAApplyUtils.cuh>   // 代替 THCDeviceUtils.cuh
 
-#include <THC/THC.h>
-#include <THC/THCDeviceUtils.cuh>
+#include <c10/cuda/CUDAGuard.h>           // 替代 THCState
+#include <c10/cuda/CUDAStream.h>
 
 #include <vector>
 #include <iostream>

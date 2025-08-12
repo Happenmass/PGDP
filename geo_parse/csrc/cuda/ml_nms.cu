@@ -1,14 +1,19 @@
 // Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAApplyUtils.cuh>   // 代替 THCDeviceUtils.cuh
 
-#include <THC/THC.h>
-#include <THC/THCDeviceUtils.cuh>
+#include <c10/cuda/CUDAGuard.h>           // 替代 THCState
+#include <c10/cuda/CUDAStream.h>
 
 #include <vector>
 #include <iostream>
 
 int const threadsPerBlock = sizeof(unsigned long long) * 8;
+
+__host__ __device__ inline int64_t CeilDiv(int64_t a, int64_t b) {
+    return (a + b - 1) / b;
+}
 
 __device__ inline float devIoU(float const * const a, float const * const b) {
   if (a[5] != b[5]) {
@@ -66,71 +71,79 @@ __global__ void ml_nms_kernel(const int n_boxes, const float nms_overlap_thresh,
         t |= 1ULL << i;
       }
     }
-    const int col_blocks = THCCeilDiv(n_boxes, threadsPerBlock);
+    const int col_blocks = CeilDiv(n_boxes, threadsPerBlock);
     dev_mask[cur_box_idx * col_blocks + col_start] = t;
   }
 }
 
 // boxes is a N x 6 tensor
 at::Tensor ml_nms_cuda(const at::Tensor boxes, float nms_overlap_thresh) {
-  using scalar_t = float;
-  AT_ASSERTM(boxes.type().is_cuda(), "boxes must be a CUDA tensor");
-  auto scores = boxes.select(1, 4);
-  auto order_t = std::get<1>(scores.sort(0, /* descending=*/true));
-  auto boxes_sorted = boxes.index_select(0, order_t);
+    using scalar_t = float;
+    TORCH_CHECK(boxes.is_cuda(), "boxes must be a CUDA tensor");
 
-  int boxes_num = boxes.size(0);
+    auto scores = boxes.select(1, 4);
+    auto order_t = std::get<1>(scores.sort(0, /* descending=*/true));
+    auto boxes_sorted = boxes.index_select(0, order_t);
 
-  const int col_blocks = THCCeilDiv(boxes_num, threadsPerBlock);
+    int boxes_num = boxes.size(0);
+    const int threadsPerBlock = 64;  // 你原代码里应该有这个定义
 
-  scalar_t* boxes_dev = boxes_sorted.data<scalar_t>();
+    const int col_blocks = CeilDiv(boxes_num, threadsPerBlock);
 
-  THCState *state = at::globalContext().lazyInitCUDA(); // TODO replace with getTHCState
+    scalar_t* boxes_dev = boxes_sorted.data_ptr<scalar_t>();
 
-  unsigned long long* mask_dev = NULL;
-  //THCudaCheck(THCudaMalloc(state, (void**) &mask_dev,
-  //                      boxes_num * col_blocks * sizeof(unsigned long long)));
+    // 新版 API 不需要 THCState，直接用 cudaMalloc
+    unsigned long long* mask_dev = nullptr;
+    C10_CUDA_CHECK(cudaMalloc(
+        (void**)&mask_dev,
+        boxes_num * col_blocks * sizeof(unsigned long long)
+    ));
 
-  mask_dev = (unsigned long long*) THCudaMalloc(state, boxes_num * col_blocks * sizeof(unsigned long long));
+    dim3 blocks(CeilDiv(boxes_num, threadsPerBlock),
+                CeilDiv(boxes_num, threadsPerBlock));
+    dim3 threads(threadsPerBlock);
 
-  dim3 blocks(THCCeilDiv(boxes_num, threadsPerBlock),
-              THCCeilDiv(boxes_num, threadsPerBlock));
-  dim3 threads(threadsPerBlock);
-  ml_nms_kernel<<<blocks, threads>>>(boxes_num,
-                                  nms_overlap_thresh,
-                                  boxes_dev,
-                                  mask_dev);
+    ml_nms_kernel<<<blocks, threads>>>(
+        boxes_num,
+        nms_overlap_thresh,
+        boxes_dev,
+        mask_dev
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  std::vector<unsigned long long> mask_host(boxes_num * col_blocks);
-  THCudaCheck(cudaMemcpy(&mask_host[0],
-                        mask_dev,
-                        sizeof(unsigned long long) * boxes_num * col_blocks,
-                        cudaMemcpyDeviceToHost));
+    std::vector<unsigned long long> mask_host(boxes_num * col_blocks);
+    C10_CUDA_CHECK(cudaMemcpy(
+        mask_host.data(),
+        mask_dev,
+        sizeof(unsigned long long) * boxes_num * col_blocks,
+        cudaMemcpyDeviceToHost
+    ));
 
-  std::vector<unsigned long long> remv(col_blocks);
-  memset(&remv[0], 0, sizeof(unsigned long long) * col_blocks);
+    std::vector<unsigned long long> remv(col_blocks);
+    memset(remv.data(), 0, sizeof(unsigned long long) * col_blocks);
 
-  at::Tensor keep = at::empty({boxes_num}, boxes.options().dtype(at::kLong).device(at::kCPU));
-  int64_t* keep_out = keep.data<int64_t>();
+    at::Tensor keep = at::empty({boxes_num}, boxes.options().dtype(at::kLong).device(at::kCPU));
+    int64_t* keep_out = keep.data_ptr<int64_t>();
 
-  int num_to_keep = 0;
-  for (int i = 0; i < boxes_num; i++) {
-    int nblock = i / threadsPerBlock;
-    int inblock = i % threadsPerBlock;
+    int num_to_keep = 0;
+    for (int i = 0; i < boxes_num; i++) {
+        int nblock = i / threadsPerBlock;
+        int inblock = i % threadsPerBlock;
 
-    if (!(remv[nblock] & (1ULL << inblock))) {
-      keep_out[num_to_keep++] = i;
-      unsigned long long *p = &mask_host[0] + i * col_blocks;
-      for (int j = nblock; j < col_blocks; j++) {
-        remv[j] |= p[j];
-      }
+        if (!(remv[nblock] & (1ULL << inblock))) {
+            keep_out[num_to_keep++] = i;
+            unsigned long long *p = mask_host.data() + i * col_blocks;
+            for (int j = nblock; j < col_blocks; j++) {
+                remv[j] |= p[j];
+            }
+        }
     }
-  }
 
-  THCudaFree(state, mask_dev);
-  // TODO improve this part
-  return std::get<0>(order_t.index({
-                       keep.narrow(/*dim=*/0, /*start=*/0, /*length=*/num_to_keep).to(
-                         order_t.device(), keep.scalar_type())
-                     }).sort(0, false));
+    C10_CUDA_CHECK(cudaFree(mask_dev));
+
+    // 返回排序后的索引
+    return std::get<0>(order_t.index({
+        keep.narrow(/*dim=*/0, /*start=*/0, /*length=*/num_to_keep)
+            .to(order_t.device(), keep.scalar_type())
+    }).sort(0, false));
 }

@@ -5,7 +5,7 @@ import os
 
 
 class DatasetCatalog(object):
-    DATA_DIR = "/lustre/home/mlzhang/Datasets/"
+    DATA_DIR = "/home/ecs-user/code/happen/PGDP"
     DATASETS = {
         "geo_train": {
             "img_dir": "Geo_All/train",

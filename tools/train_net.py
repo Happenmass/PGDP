@@ -112,7 +112,7 @@ def main():
         help="path to config file",
         type=str,
     )
-    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--local_rank", "--local-rank", type=int, default=0)
     parser.add_argument(
         "--skip-test",
         dest="skip_test",

@@ -62,7 +62,11 @@
 
 
 #include <ATen/ATen.h>
-#include <THC/THCAtomics.cuh>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAApplyUtils.cuh>   // 代替 THCDeviceUtils.cuh
+
+#include <c10/cuda/CUDAGuard.h>           // 替代 THCState
+#include <c10/cuda/CUDAStream.h>
 #include <stdio.h>
 #include <math.h>
 #include <float.h>
